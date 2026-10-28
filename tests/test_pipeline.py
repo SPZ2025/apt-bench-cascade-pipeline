@@ -85,11 +85,9 @@ class ReviewValidationTests(TestCase):
             options.append({**self.parent, 'option_id': f'PQ{i}', 'passage_id': 'CP00001',
                             'block_id': 'NB1', 'complete_natural_paragraph': True})
         p.write_rows(self.run / 'paragraph_options.jsonl', options)
-        p.write_rows(self.run / 'remaining_passages.jsonl', [self.parent])
-        group = {'candidate_id': 'CP00001', 'context_blocks': [{'block_id': 'NB1', 'separator_before': '',
-            'segments': [{'sentence_id': 'CS1', 'text': text}],
-            'options': [{'option_id': o['option_id'], 'kind': 'whole', 'token_count': o['token_count']} for o in options]}],
-            'trailing_separator': ''}
+        p.write_rows(self.run / 'remaining_passages.jsonl', [self.parent | {'boundary_review': {'decision': 'drop'}}])
+        group = {'candidate_id': 'PQ0', 'passage_id': 'CP00001', 'text': text,
+                 'token_count': len(text.split()), 'kind': 'whole'}
         self.protocol = {'prompts': {'paragraph': 'test-prompt'}}
         group['input_hash'] = p.digest({'stage': 'paragraph', 'prompt': 'test-prompt', 'input': group})
         self.group = group
@@ -97,31 +95,37 @@ class ReviewValidationTests(TestCase):
         p.write(self.run / 'jobs/paragraph/paragraph_001.json', {'job_id': 'paragraph_001', 'prompt_sha256': 'test-prompt',
             'groups': [group], 'output_path': str(self.output)})
 
-    def response(self, selections):
-        p.write(self.output, {'results': [{'candidate_id': 'CP00001', 'input_hash': self.group['input_hash'],
-            'selections': [{'option_id': s, 'reason': 'Synthetic fixture'} for s in selections], 'reason': 'Synthetic fixture'}]})
+    def response(self, decision):
+        p.write(self.output, {'results': [{'candidate_id': 'PQ0', 'input_hash': self.group['input_hash'],
+            'decision': decision, 'reason': 'Synthetic fixture'}]})
 
     def validate(self):
         with patch.object(p, 'verify_protocol', return_value=self.protocol), patch.object(p, 'count', side_effect=lambda t: len(t.split())):
             return p.stage_results(self.run, 'paragraph')
 
-    def test_zero_or_one_is_accepted(self):
-        for selected in ([], ['PQ0']):
-            self.response(selected)
-            self.assertEqual(len(self.validate()['CP00001']['selections']), len(selected))
+    def test_keep_or_drop_is_accepted(self):
+        for decision in ('keep', 'drop'):
+            self.response(decision)
+            self.assertEqual(self.validate()['PQ0']['decision'], decision)
 
     def test_two_is_rejected_before_export(self):
-        self.response(['PQ0', 'PQ1'])
-        with self.assertRaisesRegex(AssertionError, 'At most one paragraph'):
+        self.response('keep')
+        obj = p.read(self.output)
+        obj['results'].append(dict(obj['results'][0]))
+        p.write(self.output, obj)
+        with self.assertRaises(AssertionError):
             self.validate()
 
     def test_unknown_option_is_rejected(self):
-        self.response(['invented'])
+        self.response('keep')
+        obj = p.read(self.output)
+        obj['results'][0]['candidate_id'] = 'invented'
+        p.write(self.output, obj)
         with self.assertRaises(AssertionError):
             self.validate()
 
     def test_stale_hash_is_rejected(self):
-        self.response(['PQ0'])
+        self.response('keep')
         obj = p.read(self.output)
         obj['results'][0]['input_hash'] = 'stale'
         p.write(self.output, obj)
@@ -129,7 +133,7 @@ class ReviewValidationTests(TestCase):
             self.validate()
 
     def test_changed_text_is_rejected(self):
-        self.response(['PQ0'])
+        self.response('keep')
         options = p.rows(self.run / 'paragraph_options.jsonl')
         options[0]['text'] = 'Changed source text'
         p.write_rows(self.run / 'paragraph_options.jsonl', options)
@@ -158,6 +162,7 @@ class SourceAndRemainderTests(TestCase):
             p.write(run / 'paragraph_selection.json', {'whole_natural_paragraphs': 0, 'preferred_100_200': 0})
             p.write(run / 'protocol.json', {'fixture': True})
             review = {'selected_ids': [r['candidate_id'] for r in candidates], 'job_id': 'fixture',
+                      'reviewed_ids': [r['candidate_id'] for r in candidates], 'paragraph_id': 'NB1',
                       'input_hash': 'fixture', 'prompt_sha256': 'fixture', 'reviewer': 'synthetic_fixture', 'reason': 'Synthetic only'}
             doc = {'scholar_id': 'a', 'document_id': 'd', 'title': 'Synthetic'}
             unit = {'unit_id': 'u1', 'unit_title': 'Synthetic chapter', 'text': source}
@@ -186,7 +191,7 @@ class SourceAndRemainderTests(TestCase):
             p.write_rows(run / 'passages.jsonl', [occupied])
             p.write_rows(run / 'paragraphs.jsonl', [paragraph])
             with patch.object(p, 'count', side_effect=lambda t: len(t.split())), patch.object(p, 'make_jobs'):
-                p.sentence_jobs(run)
+                p.prepare_sentence_candidates(run)
             candidates = p.rows(run / 'sentence_candidates.jsonl')
             self.assertEqual(len(candidates), 1)
             self.assertEqual(candidates[0]['text'], 'Readers share resources.')

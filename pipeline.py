@@ -1,4 +1,4 @@
-"""APT cascade v2: all passing passages, <=1 paragraph/failed passage, ~200 sentences."""
+"""APT cascade v2.1: all passing passages, first acceptable paragraph, sentence batches."""
 from pathlib import Path
 from functools import lru_cache
 from collections import Counter
@@ -10,6 +10,7 @@ import os
 import re
 import sys
 import input_data
+import incremental
 
 from source_utils import paragraphs, trim, clean_heading, map_spans, restore, overlap, text_key
 from chapter_structure import structure, clean_chapter, subtract
@@ -22,7 +23,7 @@ COUNTER = None
 REVISION = '614241f622f53c4eeff9890bdc4f31cfecc418b3'
 TOKENIZER = Path.home() / '.cache/huggingface/hub/models--intfloat--multilingual-e5-small/snapshots' / REVISION / 'tokenizer.json'
 SENTENCE_TARGET = 200
-POLICY = {'version': 2, 'passage_selection': 'all_keep', 'paragraph_limit_per_parent': 1,
+POLICY = {'version': '2.1', 'paragraph_search': 'first_acceptable', 'sentence_review': 'incremental_batches', 'passage_selection': 'all_keep', 'paragraph_limit_per_parent': 1,
           'paragraph_pool': 'all_not_passed', 'sentence_scope': 'all_source_minus_selected_targets'}
 
 
@@ -242,7 +243,7 @@ def prepare(run, author):
     print(json.dumps({'chapters': len(chapters), 'passages': len(candidates), 'split_status': dict(Counter(s['status'] for s in status))}), flush=True)
 
 
-def make_jobs(run, stage, groups, char_budget=54000):
+def make_jobs(run, stage, groups, char_budget=54000, round_id=None):
     prompt = PROMPTS[stage].read_text(encoding='utf-8')
     batches, batch, size = [], [], 0
     for group in groups:
@@ -255,13 +256,14 @@ def make_jobs(run, stage, groups, char_budget=54000):
         batches.append(batch)
     (run / 'jobs' / stage).mkdir(parents=True, exist_ok=True)
     (run / 'results' / stage).mkdir(parents=True, exist_ok=True)
-    expected_names = {f'{stage}_{i:03d}.json' for i in range(1, len(batches) + 1)}
-    assert {p.name for p in (run / 'jobs' / stage).glob('*.json')} <= expected_names, 'Unexpected old job files'
+    prefix = stage + (f'_r{round_id:04d}' if round_id is not None else '')
+    expected_names = {f'{prefix}_{i:03d}.json' for i in range(1, len(batches) + 1)}
+    assert {p.name for p in (run / 'jobs' / stage).glob(prefix + '_*.json')} <= expected_names, 'Unexpected old job files'
     for i, batch in enumerate(batches, 1):
-        jobid = f'{stage}_{i:03d}'
+        jobid = f'{prefix}_{i:03d}'
         path = run / 'jobs' / stage / f'{jobid}.json'
         value = {
-            'job_id': jobid, 'stage': stage, 'prompt': prompt, 'prompt_sha256': sha(prompt), 'groups': batch,
+            'job_id': jobid, 'stage': stage, 'round': round_id, 'prompt': prompt, 'prompt_sha256': sha(prompt), 'groups': batch,
             'output_path': str(run / 'results' / stage / f'{jobid}.json'),
             'execution_rules': ['Read only this assignment. No web, no source modifications.',
                 'Use the existing Python interpreter with -B; no installations or downloads.',
@@ -313,31 +315,17 @@ def stage_results(run, stage, require_all=True):
                 assert set(r) == {'candidate_id', 'input_hash', 'decision', 'reason'}
                 assert r['decision'] in ('keep', 'drop', 'need_more')
             elif stage == 'paragraph':
-                assert set(r) == {'candidate_id', 'input_hash', 'selections', 'reason'}
-                assert isinstance(r['selections'], list)
-                assert len(r['selections']) <= 1, 'At most one paragraph per failed passage; return to the agent.'
-                options = {o['option_id'] for block in g['context_blocks'] for o in block['options']}
-                described = {o['option_id']: (block, o) for block in g['context_blocks'] for o in block['options']}
-                reviewed_context = ''.join(block['separator_before'] + ''.join(s['text'] for s in block['segments']) for block in g['context_blocks']) + g['trailing_separator']
-                assert paragraph_parents[r['candidate_id']]['text'] == reviewed_context
-                chosen = [s['option_id'] for s in r['selections']]
-                assert len(chosen) == len(set(chosen)) and set(chosen) <= options
-                assert all(set(s) == {'option_id', 'reason'} and isinstance(s['reason'], str) and s['reason'].strip() for s in r['selections'])
-                for i, option_id in enumerate(chosen):
-                    left = paragraph_options[option_id]
-                    assert left['passage_id'] == r['candidate_id']
-                    block, description = described[option_id]
-                    assert left['block_id'] == block['block_id'] and left['token_count'] == description['token_count']
-                    if description['kind'] == 'whole':
-                        expected_text = ''.join(s['text'] for s in block['segments'])
-                        assert left['complete_natural_paragraph']
-                    else:
-                        first = next(i for i, s in enumerate(block['segments']) if s['sentence_id'] == description['first_sentence'])
-                        last = next(i for i, s in enumerate(block['segments']) if s['sentence_id'] == description['last_sentence'])
-                        expected_text = ''.join(s['text'] for s in block['segments'][first:last + 1])
-                    assert left['text'] == expected_text and 100 <= count(expected_text) <= 300
-                    for other_id in chosen[i + 1:]:
-                        assert not overlap(left['source_spans'], paragraph_options[other_id]['source_spans']), ('Overlapping agent choices', job['job_id'], option_id, other_id)
+                assert set(r) == {'candidate_id', 'input_hash', 'decision', 'reason'}
+                assert r['decision'] in ('keep', 'drop')
+                option = paragraph_options[r['candidate_id']]
+                parent = paragraph_parents[g['passage_id']]
+                assert parent['boundary_review']['decision'] != 'keep'
+                assert option['passage_id'] == g['passage_id'] and option['text'] == g['text']
+                assert option['token_count'] == g['token_count'] == count(g['text'])
+                assert 100 <= g['token_count'] <= 300
+                assert (g['kind'] == 'whole') == option['complete_natural_paragraph']
+                a, b = option['clean_start'] - parent['clean_start'], option['clean_end'] - parent['clean_start']
+                assert 0 <= a < b <= len(parent['text']) and parent['text'][a:b] == option['text']
             else:
                 assert set(r) == {'candidate_id', 'input_hash', 'selected_ids', 'reason'}
                 assert isinstance(r['selected_ids'], list)
@@ -346,10 +334,13 @@ def stage_results(run, stage, require_all=True):
                 described = {s['candidate_id']: s['text'] for s in g['segments'] if s['candidate_id'] is not None}
                 for sid in r['selected_ids']:
                     assert sentence_options[sid]['text'] == described[sid]
-                    assert sentence_options[sid]['paragraph_id'] == r['candidate_id']
+                    assert sentence_options[sid]['paragraph_id'] == g['paragraph_id']
                     assert sentence_options[sid]['paragraph'] == ''.join(s['text'] for s in g['segments'])
             output[r['candidate_id']] = {**r, 'job_id': job['job_id'], 'prompt_sha256': job['prompt_sha256'],
                                         'reviewer': 'agent_assignment:' + job['job_id']}
+            if stage == 'sentence':
+                output[r['candidate_id']]['reviewed_ids'] = sorted(choices)
+                output[r['candidate_id']]['paragraph_id'] = g['paragraph_id']
     return output
 
 
@@ -415,14 +406,13 @@ def annotated_segments(chapter_text, block, a, b):
     return pieces
 
 
-def paragraph_jobs(run):
+def prepare_paragraph_options(run):
     chapters = {c['chapter_id']: c for c in rows(run / 'chapters.jsonl')}
     blocks = natural_blocks(run)
-    groups, options = [], []
+    options = []
     for p in rows(run / 'remaining_passages.jsonl'):
         assert p['boundary_review']['decision'] != 'keep', 'Paragraph parents must not have passed baseline one.'
         c = chapters[p['chapter_id']]
-        context_blocks, cursor = [], p['clean_start']
         for block in blocks:
             if block['chapter_id'] != p['chapter_id']:
                 continue
@@ -430,18 +420,14 @@ def paragraph_jobs(run):
             if a >= b:
                 continue
             complete = a == block['clean_start'] and b == block['clean_end']
-            item = {'block_id': block['block_id'], 'complete_natural_paragraph': complete,
-                    'token_count': count(c['text'][a:b]), 'separator_before': c['text'][cursor:a],
-                    'segments': annotated_segments(c['text'], block, a, b), 'options': []}
+            block_tokens = count(c['text'][a:b])
             def option(x, y, kind, first=None, last=None):
                 r = source_row(c, x, y, kind)
                 r.update(option_id=f'PQ{len(options) + 1:06d}', passage_id=p['candidate_id'],
                          block_id=block['block_id'], complete_natural_paragraph=kind == 'whole_natural_paragraph')
                 assert 100 <= r['token_count'] <= 300
                 options.append(r)
-                item['options'].append({'option_id': r['option_id'], 'kind': 'whole' if r['complete_natural_paragraph'] else 'excerpt',
-                    'first_sentence': first, 'last_sentence': last, 'token_count': r['token_count']})
-            if complete and 100 <= item['token_count'] <= 300:
+            if complete and 100 <= block_tokens <= 300:
                 option(a, b, 'whole_natural_paragraph')
             ss = [s for s in block['sentences'] if a <= s['start'] < s['end'] <= b]
             for i, first in enumerate(ss):
@@ -451,18 +437,11 @@ def paragraph_jobs(run):
                         break
                     if not 100 <= n <= 300:
                         continue
-                    if complete and first['start'] == a and last['end'] == b and 100 <= item['token_count'] <= 300:
+                    if complete and first['start'] == a and last['end'] == b and 100 <= block_tokens <= 300:
                         continue
                     option(first['start'], last['end'], 'continuous_sentences_within_paragraph', first['candidate_id'], last['candidate_id'])
-            context_blocks.append(item)
-            cursor = b
-        trailing = c['text'][cursor:p['clean_end']]
-        assert ''.join(v['separator_before'] + ''.join(s['text'] for s in v['segments']) for v in context_blocks) + trailing == p['text']
-        groups.append({'candidate_id': p['candidate_id'], 'chapter_title': p['chapter_title'],
-                       'boundary_decision': p['boundary_review']['decision'], 'context_blocks': context_blocks,
-                       'trailing_separator': trailing})
     write_rows(run / 'paragraph_options.jsonl', options)
-    make_jobs(run, 'paragraph', groups, char_budget=90000)
+
 
 
 def review_reference(review):
@@ -470,60 +449,32 @@ def review_reference(review):
 
 
 def select_paragraphs(run):
-    reviews = stage_results(run, 'paragraph')
-    parents = {p['candidate_id']: p for p in rows(run / 'remaining_passages.jsonl')}
-    assert all(p['boundary_review']['decision'] != 'keep' for p in parents.values())
-    assert set(reviews) == set(parents)
-    options = {r['option_id']: r for r in rows(run / 'paragraph_options.jsonl')}
-    occupied = rows(run / 'passages.jsonl')
-    chosen, deduplicated = [], []
-    for pid, review in reviews.items():
-        p = parents[pid]
-        selected = [(options[s['option_id']], s['reason']) for s in review['selections']]
-        assert len(selected) <= 1, 'At most one paragraph per failed passage.'
-        for i, (left, why) in enumerate(selected):
-            assert left['passage_id'] == pid
-            for right, other_why in selected[i + 1:]:
-                assert not overlap(left['source_spans'], right['source_spans']), ('Overlapping agent options', review['job_id'], left['option_id'], right['option_id'])
-        for r, reason in sorted(selected, key=lambda v: v[0]['clean_start']):
-            if any(conflicts(r, q) for q in occupied + chosen):
-                deduplicated.append(r['option_id'])
-                continue
-            assert 100 <= count(r['text']) == r['token_count'] <= 300
-            assert p['clean_start'] <= r['clean_start'] < r['clean_end'] <= p['clean_end']
-            chosen.append({**r, 'sample_id': f'CF{len(chosen) + 1:06d}',
-                'context': p['text'], 'context_source_spans': p['source_spans'],
-                'parent_boundary_decision': p['boundary_review']['decision'],
-                'paragraph_review': {**review_reference(review), 'group_id': pid, 'selection_reason': reason}})
-    write_rows(run / 'paragraphs.jsonl', chosen)
-    write(run / 'paragraph_selection.json', {'selected': len(chosen), 'deduplicated_options': deduplicated,
-          'whole_natural_paragraphs': sum(r['complete_natural_paragraph'] for r in chosen),
-          'preferred_100_200': sum(100 <= r['token_count'] <= 200 for r in chosen)})
-    print(read(run / 'paragraph_selection.json'))
+    return incremental.select_paragraphs(sys.modules[__name__], run)
 
 
-def sentence_jobs(run):
+def prepare_sentence_candidates(run):
     chapters = {c['chapter_id']: c for c in rows(run / 'chapters.jsonl')}
     occupied = rows(run / 'passages.jsonl') + rows(run / 'paragraphs.jsonl')
-    groups, candidates = [], []
+    candidates = []
     for block in natural_blocks(run):
         c = chapters[block['chapter_id']]
-        eligible = set()
         for s in block['sentences']:
             r = source_row(c, s['start'], s['end'], 'sentence')
             if any(conflicts(r, q) for q in occupied):
                 continue
             r.update(candidate_id=s['candidate_id'], paragraph_id=block['block_id'],
                      paragraph=block['text'], paragraph_source_spans=block['source_spans'])
-            candidates.append(r); eligible.add(s['candidate_id'])
-        if not eligible:
-            continue
-        segments = annotated_segments(c['text'], block, block['clean_start'], block['clean_end'])
-        groups.append({'candidate_id': block['block_id'], 'chapter_title': block['chapter_title'],
-                       'segments': [{'candidate_id': s['sentence_id'] if s['sentence_id'] in eligible else None,
-                                     'text': s['text']} for s in segments]})
+            candidates.append(r)
     write_rows(run / 'sentence_candidates.jsonl', candidates)
-    make_jobs(run, 'sentence', groups, char_budget=90000)
+
+
+
+def paragraph_jobs(run):
+    return incremental.paragraph_jobs(sys.modules[__name__], run)
+
+
+def sentence_jobs(run):
+    return incremental.sentence_jobs(sys.modules[__name__], run)
 
 
 def choose_sentences(candidates, limit):
@@ -533,24 +484,16 @@ def choose_sentences(candidates, limit):
 
 
 def finalize(run):
-    reviews = stage_results(run, 'sentence')
-    candidates = {r['candidate_id']: r for r in rows(run / 'sentence_candidates.jsonl')}
-    assert set(reviews) == {r['paragraph_id'] for r in candidates.values()}
+    state = incremental.sentence_progress(sys.modules[__name__], run)
+    assert state['complete'], 'Sentence target not met and unused candidates remain; run sentence-jobs again.'
     ps, fs = rows(run / 'passages.jsonl'), rows(run / 'paragraphs.jsonl')
-    chosen, deduplicated = [], []
-    for group_id, review in reviews.items():
-        for sid in sorted(review['selected_ids']):
-            r = candidates[sid]
-            assert r['paragraph_id'] == group_id
-            if any(conflicts(r, q) for q in ps + fs + chosen):
-                deduplicated.append(sid)
-                continue
-            chosen.append({**r, 'sample_id': sid, 'sentence_review': review_reference(review) | {'group_id': group_id}})
+    chosen, deduplicated = state['chosen'], state['duplicates']
     approved_count = len(chosen)
     chosen = choose_sentences(chosen, verify_protocol(run)['sentence_target'])
     sentence_stats = {'agent_approved_unique': approved_count, 'target': verify_protocol(run)['sentence_target'],
                       'selected': len(chosen), 'shortfall': max(0, verify_protocol(run)['sentence_target'] - len(chosen)),
-                      'duplicates_removed': deduplicated, 'sampling': 'uniform_midpoint_quantiles_in_source_order'}
+                      'duplicates_removed': deduplicated, 'sampling': 'incremental_uniform_midpoint_batches',
+                      'reviewed_candidates': state['reviewed'], 'unreviewed_candidates': len(rows(run / 'sentence_candidates.jsonl')) - state['reviewed']}
     write_rows(run / 'sentences.jsonl', chosen)
     write(run / 'sentence_selection.json', sentence_stats)
     registry = load_units()
@@ -590,14 +533,14 @@ def finalize(run):
         'pipeline_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         'source_units_represented': len({c['unit_id'] for c in rows(run / 'chapters.jsonl')}),
         'environment': 'Existing Python -B, offline E5; no dependency modifications.'})
-    names = ['# APT三层级联 v2', '', '| 类型 | 最终数量 |', '|---|---:|']
+    names = ['# APT三层级联 v2.1', '', '| 类型 | 最终数量 |', '|---|---:|']
     names += [f'| {kind} | {n} |' for kind, n in counts.items()]
     names += ['', f"切分共{passage_stats['N']}条passage，基准一通过{passage_stats['K']}条，全部保留，无一半上限。",
         f"paragraph中{paragraph_stats['whole_natural_paragraphs']}条为完整自然段，{len(fs) - paragraph_stats['whole_natural_paragraphs']}条为段内连续句子截取；{paragraph_stats['preferred_100_200']}条处于优先的100–200 tokens范围。",
-        'paragraph由agent直接从未通过基准一的passage中选择，每个父篇幅最多一条；100–300 E5 tokens，偏好100–200，完整自然段优先；context为所在完整passage。',
+        'paragraph逐项审核，完整自然段优先，找到第一条合格且不冲突的选项即停止；每个父篇幅最多一条；100–300 E5 tokens，偏好100–200，完整自然段优先；context为所在完整passage。',
         'paragraph的passage_id对应remaining_passages.jsonl的candidate_id；它的父篇幅作为背景保留，不在最终passages.jsonl目标表中。',
         'sentence由agent从全部原文扣除已选passage和paragraph的位置选取，paragraph为包含目标句的完整自然段。',
-        f"sentence在agent审核及去重后按原文顺序均匀选取，目标{sentence_stats['target']}条，合格不足时如实保留，缺口{sentence_stats['shortfall']}条。",
+        f"sentence分批均匀抽候选，经agent审核和去重后，不足再补，目标{sentence_stats['target']}条，合格不足时如实保留，缺口{sentence_stats['shortfall']}条。",
         '三类目标之间不重叠，不含规范化相同或包含文本，背景允许复用。',
         'source_spans为原unit.text的0基、左闭右开字符区间，顺序拼接可精确恢复原文。context_source_spans和paragraph_source_spans分别恢复两种背景。',
         '基准二、三未审核，不把基准一通过视为全文自足或连贯；paragraph有一轮选择审核，无独立二审。',
@@ -701,26 +644,7 @@ def pending(run):
 
 
 def next_step(run):
-    """Tell an agent orchestrator the next dependency-safe action."""
-    for stage, command, selected in (
-            ('boundary', 'boundary-jobs', 'passages.jsonl'),
-            ('paragraph', 'paragraph-jobs', 'paragraphs.jsonl'),
-            ('sentence', 'sentence-jobs', 'cascade_dataset.zip')):
-        folder = run / 'jobs' / stage
-        if not folder.exists():
-            print(json.dumps({'action': 'run_stage', 'stage': command}))
-            return
-        jobs = sorted(folder.glob('*.json'))
-        stage_results(run, stage, require_all=False)
-        missing = [str(p.resolve()) for p in jobs if not Path(read(p)['output_path']).exists()]
-        if missing:
-            print(json.dumps({'action': 'agent_review', 'stage': stage, 'job_files': missing}, ensure_ascii=False))
-            return
-        if not (run / selected).exists():
-            print(json.dumps({'action': 'run_stage', 'stage': {'boundary': 'select-passages',
-                'paragraph': 'select-paragraphs', 'sentence': 'finalize'}[stage]}))
-            return
-    print(json.dumps({'action': 'complete', 'archive': str(run / 'cascade_dataset.zip')}))
+    print(json.dumps(incremental.next_step(sys.modules[__name__], run), ensure_ascii=False))
 
 
 if __name__ == '__main__':

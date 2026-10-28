@@ -1,5 +1,12 @@
 # Changes
 
+## v2.1 — 2026-10-28
+
+- Review one paragraph candidate per unresolved parent per round; try whole natural paragraphs before excerpts, stop at the first usable hit. Agents receive only the current candidate; exports retain the full parent passage.
+- Sample sentence candidates in rounds: initially 1.5 times the target (300 by default), then at most 100 per refill, adjusted to the gap and observed usable yield.
+- Stop at 200 unique approved sentences or pool exhaustion; never dispatch the same sentence twice. Full paragraph backgrounds may be reused.
+- Record reviewed/unreviewed counts, preserve completed rounds and reject premature export. New protocol and prompt bindings require a new run directory.
+
 ## v2 — 2026-10-28
 
 - Preserve all baseline-one keep passages; remove the half-of-total cap.
