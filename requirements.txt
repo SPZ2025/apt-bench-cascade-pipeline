@@ -1,0 +1,6 @@
+# Runtime inventory. Reuse the existing environment; do not auto-install/upgrade.
+numpy
+torch
+tokenizers
+transformers
+sentence-transformers
